@@ -44,84 +44,94 @@ function returnPathAsArray(path) {
     };
 }
 
-function decryptFile(encryptedFilePath, password) {
+async function decryptFile(encryptedFilePath, password) {
     const input = fs.createReadStream(encryptedFilePath);
-    const orjinalPathData = returnPathAsArray(encryptedFilePath); // Dosya adını ve uzantısını almak için
-    const outputFileName = `./decrypted/${orjinalPathData.filename}.${orjinalPathData.fileExtension}`;
-    const output = fs.createWriteStream(outputFileName);
 
     return new Promise((resolve, reject) => {
-        let header = Buffer.alloc(32); // Salt (16 bayt) + IV (16 bayt)
-        let bytesRead = 0;
+        let header = Buffer.alloc(36); // Salt (16) + IV (16) + Metadata Length (4)
+        let metadata = '';
         let decipher;
 
-        input.once("data", (chunk) => {
-            // İlk 32 baytı okuyarak Salt ve IV'yi alıyoruz
-            header = chunk.slice(0, 32);
-            const salt = header.slice(0, 16);
-            const iv = header.slice(16, 32);
+        input.once('data', async (chunk) => {
+            try {
+                // İlk 36 baytı okuyarak Salt, IV ve Metadata uzunluğunu alıyoruz
+                header = chunk.slice(0, 36);
+                const salt = header.slice(0, 16);
+                const iv = header.slice(16, 32);
+                const metadataLength = header.readUInt32BE(32); // Metadata uzunluğu
 
-            console.log("Çözülen Salt:", salt);
-            console.log("Çözülen IV:", iv);
+                const metadataBuffer = chunk.slice(36, 36 + metadataLength);
+                metadata = metadataBuffer.toString('utf-8');
+                const [filename, extension] = metadata.split('|');
 
-            // Derived Key oluşturuluyor
-            const derivedKey = deriveKeyFromPassword(password, salt);
-            console.log("Çözülen Key:", derivedKey);
+                console.log('Çözülen Metadata:', { filename, extension });
 
-            // Decipher akışı oluşturuluyor
-            decipher = crypto.createDecipheriv("aes-256-cbc", derivedKey, iv);
+                const derivedKey = deriveKeyFromPassword(password, salt);
 
-            // Kalan chunk kısmını decipher akışına yazıyoruz
-            const remainingChunk = chunk.slice(32);
-            if (remainingChunk.length > 0) {
-                decipher.write(remainingChunk);
+                // Decipher akışı oluşturuluyor
+                decipher = crypto.createDecipheriv('aes-256-cbc', derivedKey, iv);
+
+                const remainingChunk = chunk.slice(36 + metadataLength);
+                let outputFileName = `./decrypted/${filename}.${extension}`;
+                let outputFileNameJson = returnPathAsArray(outputFileName);
+                outputFileName = await incrementOutputPath(outputFileNameJson); // Path kontrolü ve artırımı
+
+                const output = fs.createWriteStream(outputFileName);
+
+                if (remainingChunk.length > 0) {
+                    decipher.write(remainingChunk);
+                }
+
+                // Tüm veri akışlarını bağlama
+                input.pipe(decipher).pipe(output);
+
+                // Hata ve başarı yönetimi
+                input.on('error', reject);
+                decipher.on('error', reject);
+                output.on('error', reject);
+                output.on('finish', () => resolve(outputFileName));
+            } catch (err) {
+                reject(err);
             }
-
-            // Tüm veri akışlarını bağlama
-            input.pipe(decipher).pipe(output);
         });
 
-        // Hata yönetimi
-        input.on("error", reject);
-        output.on("error", reject);
-        output.on("finish", () => resolve(outputFileName));
+        input.on('error', reject);
     });
 }
 
+
 function encryptFile(inputPath, password) {
     const iv = crypto.randomBytes(16); // Rastgele IV oluşturma
-    const salt = crypto.randomBytes(16); // Rastgele IV oluşturma
+    const salt = crypto.randomBytes(16); // Rastgele salt oluşturma
     const derivedKey = deriveKeyFromPassword(password, salt); // Şifreden anahtar türetme
-    const cipher = crypto.createCipheriv("aes-256-cbc", derivedKey, iv);
-    const orjinalPathData = returnPathAsArray(inputPath);
-    // Dosyanın ismini SHA-256 ile hash'liyoruz (uzantısız)
+    const orjinalPathData = returnPathAsArray(inputPath); // Yolun verilerini çözme
+    const metadata = `${orjinalPathData.filename}|${orjinalPathData.fileExtension}`; // Metadata (isim ve uzantı)
+    const metadataBuffer = Buffer.from(metadata, 'utf-8');
+    const metadataLengthBuffer = Buffer.alloc(4); // Metadata uzunluğu için 4 byte
+    metadataLengthBuffer.writeUInt32BE(metadataBuffer.length, 0);
+
     const encryptedFileName = generateFileNameFromHash(inputPath, iv);
-    const encryptedFilePath =
-        `./encrypted/${encryptedFileName}.` + orjinalPathData.fileExtension; // Şifreli dosyanın yolu (hash ile adlandırıyoruz)
+    const encryptedFilePath = `./encrypted/${encryptedFileName}.enc`;
 
     return new Promise((resolve, reject) => {
         const input = fs.createReadStream(inputPath);
         const output = fs.createWriteStream(encryptedFilePath);
-        output.write(Buffer.concat([salt, iv]), (err) => {
+
+        // Dosyanın başına salt, IV, metadata uzunluğu ve metadata yazılıyor
+        output.write(Buffer.concat([salt, iv, metadataLengthBuffer, metadataBuffer]), (err) => {
             if (err) return reject(err);
 
-            console.log("Salt:", salt);
-            console.log("IV:", iv);
-            console.log("Derived Key:", derivedKey);
-
-            // Şifreleme işlemini başlatıyoruz
-            const cipher = crypto.createCipheriv("aes-256-cbc", derivedKey, iv);
+            const cipher = crypto.createCipheriv('aes-256-cbc', derivedKey, iv);
             input.pipe(cipher).pipe(output);
 
-            // Akışların hata ve başarı yönetimi
-            input.on("error", reject);
-            cipher.on("error", reject);
-            output.on("error", reject);
-            output.on("finish", () => resolve(encryptedFilePath));
+            // Hata ve başarı yönetimi
+            input.on('error', reject);
+            cipher.on('error', reject);
+            output.on('error', reject);
+            output.on('finish', () => resolve(encryptedFilePath));
         });
     });
 }
-
 async function incrementOutputPath(data) {
     // Base URL, filename, ve extension için değişkenler tanımlıyoruz
     let newFilename = `${data.filename}`;
@@ -148,7 +158,7 @@ function generateUniqueFilename(data) {
     }
 
     return newFilename; // Benzersiz dosya adı
-}
+} 
 // Ana işlem kısmını async/await ile düzenleyelim
  function main() {
     // Yeni bir şifre oluştur
@@ -169,7 +179,7 @@ function generateUniqueFilename(data) {
  function main2() {
     try {
         decryptFile(
-            "./encrypted/3430aa4b28ff9a201b917bbeb01df8453acba5cd49d3a08b8bd3267dbb87919f.JPEG",
+            "./encrypted/96ebf6eba6c24a4fcc3c383fff49b72fa7a74695226910791d88474f4708eb53.enc",
             "sifre123"
         )
             .then((decryptedFilePath) => {
